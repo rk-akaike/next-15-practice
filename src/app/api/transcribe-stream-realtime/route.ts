@@ -35,7 +35,6 @@ setInterval(() => {
 
   for (const [sessionId, session] of activeSessions.entries()) {
     if (session.createdAt < fiveMinutesAgo) {
-      console.log(`🧹 Cleaning up old session: ${sessionId}`);
       cleanupSession(sessionId);
     }
   }
@@ -61,16 +60,11 @@ export async function OPTIONS() {
 // ============================================================================
 
 export async function GET(request: NextRequest) {
-  console.log("📡 Starting new SSE connection");
-
   const sessionId = generateSessionId();
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     start(controller) {
-      console.log(`✅ SSE stream started for session: ${sessionId}`);
-
-      // Create session
       const session: StreamSession = {
         controller,
         encoder,
@@ -82,14 +76,12 @@ export async function GET(request: NextRequest) {
 
       activeSessions.set(sessionId, session);
 
-      // Send connection confirmation
       sendMessage(session, {
         type: "connected",
         sessionId,
         message: "Real-time transcription ready",
       });
 
-      // Setup heartbeat to keep connection alive
       const heartbeatInterval = setInterval(() => {
         if (session.isActive) {
           sendMessage(session, {
@@ -99,18 +91,15 @@ export async function GET(request: NextRequest) {
         } else {
           clearInterval(heartbeatInterval);
         }
-      }, 30000); // Every 30 seconds
+      }, 30000);
 
-      // Auto-cleanup after 10 minutes
       setTimeout(() => {
-        console.log(`⏰ Auto-cleanup session: ${sessionId}`);
         cleanupSession(sessionId);
         clearInterval(heartbeatInterval);
       }, 10 * 60 * 1000);
     },
 
     cancel() {
-      console.log(`📡 SSE stream cancelled for session: ${sessionId}`);
       cleanupSession(sessionId);
     },
   });
@@ -135,12 +124,10 @@ export async function POST(request: NextRequest) {
     const { searchParams } = new URL(request.url);
     const sessionId = searchParams.get("session");
 
-    // Validate session ID
     if (!sessionId) {
       return createErrorResponse("Session ID required", 400);
     }
 
-    // Get session
     const session = activeSessions.get(sessionId);
     if (!session) {
       return createErrorResponse("Session not found or expired", 404);
@@ -150,39 +137,28 @@ export async function POST(request: NextRequest) {
       return createErrorResponse("Session is no longer active", 410);
     }
 
-    // Get audio data
     const audioData = await request.arrayBuffer();
     const audioBytes = new Uint8Array(audioData);
 
     if (audioBytes.length === 0) {
-      return createSuccessResponse(); // Ignore empty audio
+      return createSuccessResponse();
     }
 
-    // Process audio based on content type
     const contentType = request.headers.get("content-type");
     let pcmData: Uint8Array;
 
     if (contentType === "audio/pcm") {
       pcmData = audioBytes;
     } else {
-      // For non-PCM data, we'll skip complex conversion and return success
-      // This prevents 404 errors when the frontend sends other formats
-      console.log(`⚠️ Unsupported audio format: ${contentType}, ignoring`);
       return createSuccessResponse();
     }
 
-    // Queue audio data
     if (pcmData.length > 0) {
       session.audioQueue.push(pcmData);
 
-      // Initialize AWS transcription if not started
       if (!session.isTranscribeStreamStarted) {
         session.isTranscribeStreamStarted = true;
         initializeAWSTranscription(session, sessionId).catch((error) => {
-          console.error(
-            `❌ AWS initialization failed for ${sessionId}:`,
-            error
-          );
           session.isTranscribeStreamStarted = false;
 
           sendMessage(session, {
@@ -195,7 +171,6 @@ export async function POST(request: NextRequest) {
 
     return createSuccessResponse();
   } catch (error) {
-    console.error("❌ POST request error:", error);
     return createErrorResponse("Internal server error", 500);
   }
 }
@@ -208,18 +183,13 @@ async function initializeAWSTranscription(
   session: StreamSession,
   sessionId: string
 ): Promise<void> {
-  console.log(`🚀 Initializing AWS Transcribe for session: ${sessionId}`);
-
   try {
-    // Initialize AWS client
     if (!session.transcribeClient) {
       session.transcribeClient = createTranscribeClient();
     }
 
-    // Create audio stream generator
     const audioStream = createAudioStreamGenerator(sessionId);
 
-    // Start transcription
     const command = new StartStreamTranscriptionCommand({
       LanguageCode: "en-US",
       MediaEncoding: "pcm",
@@ -227,11 +197,9 @@ async function initializeAWSTranscription(
       AudioStream: audioStream,
     });
 
-    console.log(`✅ Starting AWS Transcribe stream for session: ${sessionId}`);
     const response = await session.transcribeClient.send(command);
 
     if (response.TranscriptResultStream) {
-      // Process transcript events
       for await (const event of response.TranscriptResultStream) {
         if (event.TranscriptEvent && session.isActive) {
           await handleTranscriptEvent(event.TranscriptEvent, session);
@@ -239,9 +207,6 @@ async function initializeAWSTranscription(
       }
     }
 
-    console.log(`🏁 AWS Transcribe stream ended for session: ${sessionId}`);
-
-    // Send completion message
     if (session.isActive) {
       sendMessage(session, {
         type: "completed",
@@ -249,8 +214,6 @@ async function initializeAWSTranscription(
       });
     }
   } catch (error) {
-    console.error(`❌ AWS Transcribe error for session ${sessionId}:`, error);
-
     if (session.isActive) {
       sendMessage(session, {
         type: "error",
@@ -266,7 +229,6 @@ function createTranscribeClient(): TranscribeStreamingClient {
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
   };
 
-  // Add session token if available (for temporary credentials)
   if (process.env.AWS_SESSION_TOKEN) {
     credentials.sessionToken = process.env.AWS_SESSION_TOKEN;
   }
@@ -280,8 +242,6 @@ function createTranscribeClient(): TranscribeStreamingClient {
 async function* createAudioStreamGenerator(
   sessionId: string
 ): AsyncIterable<AudioStream> {
-  console.log(`🎵 Starting audio stream generator for session: ${sessionId}`);
-
   let chunkCount = 0;
 
   while (activeSessions.has(sessionId)) {
@@ -291,7 +251,6 @@ async function* createAudioStreamGenerator(
       break;
     }
 
-    // Process all queued audio chunks
     const chunksToProcess = session.audioQueue.length;
 
     if (chunksToProcess > 0) {
@@ -309,13 +268,8 @@ async function* createAudioStreamGenerator(
       }
     }
 
-    // Small delay to prevent busy waiting
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-
-  console.log(
-    `🏁 Audio stream generator ended for session: ${sessionId}. Total chunks: ${chunkCount}`
-  );
 }
 
 async function handleTranscriptEvent(
@@ -333,12 +287,6 @@ async function handleTranscriptEvent(
         const isFinal = !result.IsPartial;
 
         if (transcript.trim()) {
-          console.log(
-            `📝 ${isFinal ? "FINAL" : "PARTIAL"}: "${transcript}" (${(
-              confidence * 100
-            ).toFixed(1)}%)`
-          );
-
           sendMessage(session, {
             type: isFinal ? "final" : "partial",
             transcript: transcript,
@@ -349,7 +297,7 @@ async function handleTranscriptEvent(
       }
     }
   } catch (error) {
-    console.error("❌ Error handling transcript:", error);
+    // Handle error silently
   }
 }
 
@@ -368,7 +316,6 @@ function sendMessage(session: StreamSession, data: any): void {
     const message = `data: ${JSON.stringify(data)}\n\n`;
     session.controller.enqueue(session.encoder.encode(message));
   } catch (error) {
-    console.log("⚠️ Failed to send message - controller closed");
     session.isActive = false;
   }
 }
@@ -386,7 +333,6 @@ function cleanupSession(sessionId: string): void {
     }
 
     activeSessions.delete(sessionId);
-    console.log(`🧹 Session cleaned up: ${sessionId}`);
   }
 }
 

@@ -1,7 +1,0 @@
-<speak>
-  <prosody rate="slow">
-    Hello! This is a test message.
-    <break time="500ms"/>
-    Testing the text to speech service.
-  </prosody>
-</speak>
