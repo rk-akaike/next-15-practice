@@ -2,6 +2,10 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 
+// ============================================================================
+// TYPES AND INTERFACES
+// ============================================================================
+
 interface StreamingTranscriptEvent {
   type: "connected" | "partial" | "final" | "completed" | "error";
   transcript?: string;
@@ -9,341 +13,216 @@ interface StreamingTranscriptEvent {
   timestamp?: string;
   message?: string;
   error?: string;
-  note?: string;
-  audioLevel?: number;
+  sessionId?: string;
 }
 
+interface AudioStreamConfig {
+  sampleRate: number;
+  bufferSize: number;
+  sendIntervalMs: number;
+  silenceThreshold: number;
+  silenceTimeoutMs: number;
+}
+
+// ============================================================================
+// CONSTANTS AND CONFIGURATION
+// ============================================================================
+
+const AUDIO_CONFIG: AudioStreamConfig = {
+  sampleRate: 16000,
+  bufferSize: 1024, // Increased from 256 to reduce CPU load
+  sendIntervalMs: 100, // Reduced from 20ms to 100ms (10 requests/sec instead of 50)
+  silenceThreshold: 0.005, // Lowered threshold to be more sensitive to voice
+  silenceTimeoutMs: 5000, // 5 seconds
+};
+
+const UI_MESSAGES = {
+  ready: "Click to start AWS Transcribe streaming",
+  recording: "Streaming to AWS Transcribe - speak now!",
+  connecting: "Connecting to AWS Transcribe...",
+  error: "Error occurred - click to try again",
+  completed: "Transcription completed",
+} as const;
+
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+
 export default function SpeechToText() {
+  // State management
   const [isRecording, setIsRecording] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
   const [currentTranscript, setCurrentTranscript] = useState("");
   const [finalTranscript, setFinalTranscript] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [debugInfo, setDebugInfo] = useState<string | null>(null);
 
-  const mediaRecorderRef = useRef<MediaRecorder | ScriptProcessorNode | null>(
-    null
-  );
-  const streamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const sessionIdRef = useRef<string | null>(null);
+  // Refs for cleanup and management
+  const audioManagerRef = useRef<AudioStreamManager | null>(null);
+  const connectionManagerRef = useRef<ConnectionManager | null>(null);
+  const silenceDetectorRef = useRef<SilenceDetector | null>(null);
 
-  // Voice activity detection
-  const checkVoiceActivity = useCallback(() => {
-    if (!analyserRef.current) return false;
-
-    const bufferLength = analyserRef.current.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    analyserRef.current.getByteFrequencyData(dataArray);
-
-    const average =
-      dataArray.reduce((sum, value) => sum + value, 0) / bufferLength;
-    const threshold = 25;
-
-    console.log(
-      `🔊 Audio level: ${average.toFixed(1)} (threshold: ${threshold})`
-    );
-    return average > threshold;
-  }, []);
-
-  const startVoiceActivityDetection = useCallback(() => {
-    let silenceStartTime: number | null = null;
-
-    const checkActivity = () => {
-      if (!isRecording) return;
-
-      const hasVoice = checkVoiceActivity();
-
-      if (hasVoice) {
-        if (silenceTimerRef.current) {
-          clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = null;
-        }
-        silenceStartTime = null;
-        setDebugInfo("🎤 Voice detected - transcribing in real-time...");
-      } else {
-        if (!silenceStartTime) {
-          silenceStartTime = Date.now();
-          setDebugInfo("🔇 Silence detected, will stop in 5 seconds...");
-
-          silenceTimerRef.current = setTimeout(() => {
-            console.log("⏰ Auto-stopping due to 5 seconds of silence");
-            setDebugInfo("⏹️ Stopped recording due to 5 seconds of silence");
-            stopRecording();
-          }, 5000);
-        } else {
-          const elapsed = Math.floor((Date.now() - silenceStartTime) / 1000);
-          const remaining = 5 - elapsed;
-          if (remaining > 0) {
-            setDebugInfo(`🔇 Silence... stopping in ${remaining} seconds`);
-          }
-        }
-      }
-
-      if (isRecording) {
-        setTimeout(checkActivity, 500);
-      }
-    };
-
-    checkActivity();
-  }, [isRecording, checkVoiceActivity]);
+  // ============================================================================
+  // MAIN FUNCTIONS
+  // ============================================================================
 
   const startRecording = async () => {
     try {
-      setError(null);
-      setDebugInfo(null);
-      setCurrentTranscript("");
-      setFinalTranscript("");
+      // Reset state
+      resetState();
+      setIsConnecting(true);
+      setDebugInfo("🔌 Connecting to AWS Transcribe...");
 
-      console.log("🎙️ Starting real-time streaming transcription...");
-
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      // Check browser support
+      if (!isBrowserSupported()) {
         throw new Error(
           "Your browser doesn't support microphone access. Please use Chrome, Firefox, or Safari."
         );
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          sampleRate: 16000,
-        },
-      });
+      // Get microphone permission
+      const stream = await getMicrophoneStream();
 
-      streamRef.current = stream;
+      // Initialize connection manager
+      connectionManagerRef.current = new ConnectionManager(
+        handleTranscriptEvent
+      );
+      const sessionId = await connectionManagerRef.current.connect();
 
-      // Set up audio context for both voice detection and PCM capture
-      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-
-      // Analyzer for voice activity detection
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      analyserRef.current.fftSize = 256;
-      source.connect(analyserRef.current);
-
-      // Start streaming connection and get session ID
-      const sessionId = await startStreamingConnection();
-      sessionIdRef.current = sessionId;
-      console.log("✅ Session ID received:", sessionId);
-
-      // Use ScriptProcessorNode to capture raw PCM audio
-      const scriptProcessor = audioContextRef.current.createScriptProcessor(
-        4096,
-        1,
-        1
+      // Initialize audio manager
+      audioManagerRef.current = new AudioStreamManager(
+        stream,
+        sessionId,
+        AUDIO_CONFIG
       );
 
-      scriptProcessor.onaudioprocess = async (event) => {
-        if (!sessionIdRef.current) return;
+      // Initialize silence detector
+      silenceDetectorRef.current = new SilenceDetector(
+        AUDIO_CONFIG,
+        handleSilenceDetected,
+        setDebugInfo
+      );
 
-        const inputBuffer = event.inputBuffer;
-        const inputData = inputBuffer.getChannelData(0);
+      // Start everything
+      await audioManagerRef.current.start(silenceDetectorRef.current);
+      silenceDetectorRef.current.start();
 
-        // Convert float32 to int16 PCM
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const sample = Math.max(-1, Math.min(1, inputData[i]));
-          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        }
-
-        // Convert to Uint8Array for transmission
-        const uint8Data = new Uint8Array(pcmData.buffer);
-
-        console.log("📡 Sending raw PCM audio:", uint8Data.length, "bytes");
-
-        // Send raw PCM data to backend
-        try {
-          const response = await fetch(
-            `/api/transcribe-stream-realtime?session=${sessionIdRef.current}`,
-            {
-              method: "POST",
-              body: uint8Data,
-              headers: {
-                "Content-Type": "audio/pcm",
-              },
-            }
-          );
-
-          if (!response.ok) {
-            console.warn("⚠️ Failed to send PCM chunk:", response.status);
-          }
-        } catch (error) {
-          console.error("❌ Error sending PCM chunk:", error);
-        }
-      };
-
-      // Connect the audio processing chain
-      source.connect(scriptProcessor);
-      scriptProcessor.connect(audioContextRef.current.destination);
-
-      // Store the processor for cleanup
-      mediaRecorderRef.current = scriptProcessor as any;
+      // Update UI state
       setIsRecording(true);
-
-      // Start voice activity detection
-      startVoiceActivityDetection();
-
-      setDebugInfo("🎙️ Recording started - real-time streaming active!");
+      setIsConnecting(false);
+      setIsConnected(true);
+      setDebugInfo("🎙️ Recording started - speak now!");
     } catch (err) {
-      console.error("❌ Error starting recording:", err);
-
-      let errorMessage = "Failed to start recording";
-
-      if (err instanceof Error) {
-        if (err.name === "NotAllowedError") {
-          errorMessage =
-            "Microphone access denied. Please allow microphone access and try again.";
-        } else if (err.name === "NotFoundError") {
-          errorMessage =
-            "No microphone found. Please connect a microphone and try again.";
-        } else if (err.name === "NotSupportedError") {
-          errorMessage =
-            "Your browser doesn't support this feature. Please use Chrome, Firefox, or Safari.";
-        } else {
-          errorMessage = err.message;
-        }
-      }
-
-      setError(errorMessage);
+      handleStartRecordingError(err);
     }
   };
 
-  const startStreamingConnection = async (): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      try {
-        console.log("📡 Starting real-time streaming connection...");
+  const stopRecording = useCallback(() => {
+    console.log("⏹️ Stopping recording...");
 
-        const eventSource = new EventSource("/api/transcribe-stream-realtime", {
-          withCredentials: false,
-        });
-        eventSourceRef.current = eventSource;
+    try {
+      // Stop all managers
+      silenceDetectorRef.current?.stop();
+      audioManagerRef.current?.stop();
+      connectionManagerRef.current?.disconnect();
 
-        eventSource.onopen = () => {
-          console.log("📡 Real-time stream connected");
-          setIsConnected(true);
-          setDebugInfo("✅ Real-time streaming active");
-        };
+      // Reset refs
+      silenceDetectorRef.current = null;
+      audioManagerRef.current = null;
+      connectionManagerRef.current = null;
 
-        eventSource.onmessage = (event) => {
-          try {
-            const data: StreamingTranscriptEvent = JSON.parse(event.data);
-
-            if (data.type === "connected" && "sessionId" in data) {
-              resolve((data as any).sessionId);
-            }
-
-            handleTranscriptEvent(data);
-          } catch (parseError) {
-            console.warn("Failed to parse SSE message:", parseError);
-          }
-        };
-
-        eventSource.onerror = (error) => {
-          console.error("❌ SSE error:", error);
-          setError("Streaming connection failed");
-          setIsConnected(false);
-          reject(error);
-        };
-      } catch (error) {
-        console.error("❌ Failed to start streaming connection:", error);
-        reject(error);
-      }
-    });
-  };
-
-  const stopRecording = () => {
-    console.log("⏹️ Stopping real-time recording...");
-
-    if (mediaRecorderRef.current && isRecording) {
-      // Handle different types of audio processors
-      if (mediaRecorderRef.current instanceof ScriptProcessorNode) {
-        mediaRecorderRef.current.disconnect();
-      } else if (mediaRecorderRef.current instanceof MediaRecorder) {
-        mediaRecorderRef.current.stop();
-      }
+      // Update UI state
       setIsRecording(false);
-    }
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
+      setIsConnecting(false);
+      setIsConnected(false);
+      setDebugInfo("⏹️ Recording stopped");
+    } catch (err) {
+      console.error("Error stopping recording:", err);
+      // Still update UI even if cleanup fails
+      setIsRecording(false);
+      setIsConnecting(false);
       setIsConnected(false);
     }
+  }, []);
 
-    sessionIdRef.current = null;
-  };
+  // ============================================================================
+  // EVENT HANDLERS
+  // ============================================================================
 
-  const handleTranscriptEvent = (event: StreamingTranscriptEvent) => {
-    console.log("📨 Received real-time transcript:", event);
+  const handleTranscriptEvent = useCallback(
+    (event: StreamingTranscriptEvent) => {
+      console.log("📨 Transcript event:", event.type, event.transcript || "");
 
-    switch (event.type) {
-      case "connected":
-        setIsConnected(true);
-        setDebugInfo("✅ Real-time streaming active");
-        break;
+      switch (event.type) {
+        case "connected":
+          setIsConnected(true);
+          setDebugInfo("✅ Connected to AWS Transcribe");
+          break;
 
-      case "partial":
-        if (event.transcript) {
-          setCurrentTranscript(event.transcript);
-          setDebugInfo(`🔄 Live: ${event.transcript}`);
-        }
-        break;
+        case "partial":
+          if (event.transcript) {
+            setCurrentTranscript(event.transcript);
+            setDebugInfo(`🔄 ${event.transcript}`);
+          }
+          break;
 
-      case "final":
-        if (event.transcript) {
-          const newFinalTranscript = finalTranscript + event.transcript + " ";
-          setFinalTranscript(newFinalTranscript);
-          setCurrentTranscript("");
-          setDebugInfo(
-            `✅ Final: ${event.transcript} (${(
-              (event.confidence || 0) * 100
-            ).toFixed(1)}%)`
-          );
+        case "final":
+          if (event.transcript) {
+            setFinalTranscript((prev) => prev + event.transcript + " ");
+            setCurrentTranscript("");
+            setDebugInfo(
+              `✅ Final: ${event.transcript} (${(
+                (event.confidence || 0) * 100
+              ).toFixed(1)}%)`
+            );
+          }
+          break;
 
-          console.log(
-            `📝 FINAL TRANSCRIPT UPDATE: "${newFinalTranscript.trim()}"`
-          );
-        }
-        break;
+        case "completed":
+          setDebugInfo("🎉 Transcription completed!");
+          setTimeout(stopRecording, 100);
+          break;
 
-      case "completed":
-        setIsConnected(false);
-        setDebugInfo("🎉 Real-time transcription completed!");
-        break;
-
-      case "error":
-        if (
-          event.error?.includes("AWS") ||
-          event.error?.includes("credentials")
-        ) {
-          setError(
-            `AWS Configuration Error: ${event.error}. Please check your .env.local file.`
-          );
-        } else {
+        case "error":
           setError(event.error || "Unknown transcription error");
-        }
-        setIsConnected(false);
-        break;
+          setTimeout(stopRecording, 100);
+          break;
+      }
+    },
+    [stopRecording]
+  );
+
+  const handleSilenceDetected = useCallback(() => {
+    console.log("🔇 Silence detected - auto-stopping");
+    setDebugInfo("⏹️ Stopped due to 5 seconds of silence");
+    setTimeout(stopRecording, 100);
+  }, [stopRecording]);
+
+  const handleStartRecordingError = (err: unknown) => {
+    console.error("❌ Error starting recording:", err);
+
+    let errorMessage = "Failed to start recording";
+
+    if (err instanceof Error) {
+      if (err.name === "NotAllowedError") {
+        errorMessage =
+          "Microphone access denied. Please allow microphone access and try again.";
+      } else if (err.name === "NotFoundError") {
+        errorMessage =
+          "No microphone found. Please connect a microphone and try again.";
+      } else if (err.name === "NotSupportedError") {
+        errorMessage =
+          "Your browser doesn't support this feature. Please use Chrome, Firefox, or Safari.";
+      } else {
+        errorMessage = err.message;
+      }
     }
+
+    setError(errorMessage);
+    setIsRecording(false);
+    setIsConnecting(false);
+    setIsConnected(false);
   };
 
   const clearTranscription = () => {
@@ -353,22 +232,72 @@ export default function SpeechToText() {
     setDebugInfo(null);
   };
 
+  // ============================================================================
+  // HELPER FUNCTIONS
+  // ============================================================================
+
+  const resetState = () => {
+    setError(null);
+    setDebugInfo(null);
+    setCurrentTranscript("");
+    setFinalTranscript("");
+  };
+
+  const isBrowserSupported = (): boolean => {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  };
+
+  const getMicrophoneStream = async (): Promise<MediaStream> => {
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        sampleRate: AUDIO_CONFIG.sampleRate,
+      },
+    });
+  };
+
+  // ============================================================================
+  // CLEANUP
+  // ============================================================================
+
   useEffect(() => {
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-      }
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
+      // Cleanup on unmount
+      silenceDetectorRef.current?.stop();
+      audioManagerRef.current?.stop();
+      connectionManagerRef.current?.disconnect();
     };
   }, []);
+
+  // ============================================================================
+  // RENDER
+  // ============================================================================
+
+  const getButtonState = () => {
+    if (isConnecting)
+      return { icon: "🔄", disabled: true, className: "bg-yellow-500" };
+    if (isRecording)
+      return {
+        icon: "⏹",
+        disabled: false,
+        className: "bg-red-500 hover:bg-red-600 animate-pulse",
+      };
+    return {
+      icon: "🎙️",
+      disabled: false,
+      className: "bg-green-500 hover:bg-green-600",
+    };
+  };
+
+  const getStatusMessage = () => {
+    if (isConnecting) return UI_MESSAGES.connecting;
+    if (isRecording) return UI_MESSAGES.recording;
+    if (error) return UI_MESSAGES.error;
+    return UI_MESSAGES.ready;
+  };
+
+  const buttonState = getButtonState();
 
   return (
     <div className="w-full p-4 sm:p-6 lg:p-8 bg-white rounded-lg shadow-lg">
@@ -395,7 +324,7 @@ export default function SpeechToText() {
               <div className="flex items-center">
                 <div className="w-2 h-2 bg-green-500 rounded-full mr-2"></div>
                 <span className="text-green-600 font-medium text-sm sm:text-base">
-                  Real-time Active
+                  AWS Connected
                 </span>
               </div>
             )}
@@ -404,9 +333,8 @@ export default function SpeechToText() {
             )}
           </div>
         </div>
-
         <div className="mt-2 text-xs sm:text-sm text-green-700 font-medium">
-          🚀 AWS Transcribe real-time streaming - speak for live transcription!
+          🚀 AWS Transcribe real-time streaming - optimized for low latency!
         </div>
       </div>
 
@@ -415,22 +343,15 @@ export default function SpeechToText() {
         <div className="flex flex-col items-center space-y-4 sm:space-y-6">
           <button
             onClick={isRecording ? stopRecording : startRecording}
-            disabled={isConnected && !isRecording}
+            disabled={buttonState.disabled}
             className={`w-20 h-20 sm:w-24 sm:h-24 lg:w-28 lg:h-28 rounded-full flex items-center justify-center text-white font-bold text-2xl sm:text-3xl lg:text-4xl transition-all duration-300 shadow-lg hover:shadow-xl transform hover:scale-105 ${
-              isRecording
-                ? "bg-red-500 hover:bg-red-600 animate-pulse"
-                : isConnected
-                ? "bg-gray-400 cursor-not-allowed"
-                : "bg-green-500 hover:bg-green-600 active:bg-green-700"
-            }`}
+              buttonState.className
+            } ${buttonState.disabled ? "cursor-not-allowed opacity-75" : ""}`}
           >
-            {isRecording ? "⏹" : "🎙️"}
+            {buttonState.icon}
           </button>
-
           <p className="text-sm sm:text-base text-gray-600 text-center max-w-md">
-            {isRecording
-              ? "Streaming to AWS Transcribe - speak now!"
-              : "Click to start AWS Transcribe streaming"}
+            {getStatusMessage()}
           </p>
         </div>
       </div>
@@ -439,7 +360,7 @@ export default function SpeechToText() {
       <div className="mb-6 sm:mb-8">
         <div className="min-h-[120px] sm:min-h-[140px] p-4 sm:p-6 bg-gray-50 border border-gray-200 rounded-lg">
           <h3 className="font-semibold text-gray-800 mb-3 text-base sm:text-lg">
-            Live Stream Transcription:
+            Live Transcription:
           </h3>
 
           {finalTranscript && (
@@ -457,7 +378,7 @@ export default function SpeechToText() {
 
           {!finalTranscript && !currentTranscript && (
             <p className="text-gray-400 italic text-sm sm:text-base">
-              Start speaking - AWS Transcribe will transcribe in real-time...
+              Start speaking - AWS will transcribe in real-time...
             </p>
           )}
         </div>
@@ -473,6 +394,7 @@ export default function SpeechToText() {
         </button>
       </div>
 
+      {/* Error Display */}
       {error && (
         <div className="mb-4 sm:mb-6 p-3 sm:p-4 bg-red-50 border border-red-200 rounded-lg">
           <p className="text-red-600 font-medium text-sm sm:text-base">
@@ -481,6 +403,7 @@ export default function SpeechToText() {
         </div>
       )}
 
+      {/* Debug Info */}
       {debugInfo && !error && (
         <div className="mb-4 sm:mb-6 p-3 sm:p-4 bg-green-50 border border-green-200 rounded-lg">
           <p className="text-green-600 text-sm sm:text-base">{debugInfo}</p>
@@ -492,18 +415,338 @@ export default function SpeechToText() {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-3 text-center">
           <p className="flex items-center justify-center gap-2">
             <span className="text-lg">🎙️</span>
-            <span className="text-xs sm:text-sm">Click to start streaming</span>
+            <span className="text-xs sm:text-sm">Click to start</span>
           </p>
           <p className="flex items-center justify-center gap-2">
-            <span className="text-lg">📡</span>
-            <span className="text-xs sm:text-sm">5-second silence timeout</span>
+            <span className="text-lg">🔇</span>
+            <span className="text-xs sm:text-sm">
+              Auto-stop after 5s silence
+            </span>
           </p>
           <p className="flex items-center justify-center gap-2 sm:col-span-2 lg:col-span-1">
             <span className="text-lg">⚡</span>
-            <span className="text-xs sm:text-sm">Real-time transcription</span>
+            <span className="text-xs sm:text-sm">
+              Optimized for low latency
+            </span>
           </p>
         </div>
       </div>
     </div>
   );
+}
+
+// ============================================================================
+// AUDIO STREAM MANAGER CLASS
+// ============================================================================
+
+class AudioStreamManager {
+  private stream: MediaStream;
+  private sessionId: string;
+  private config: AudioStreamConfig;
+  private audioContext: AudioContext | null = null;
+  private scriptProcessor: ScriptProcessorNode | null = null;
+  private audioBuffer: Int16Array[] = [];
+  private lastSendTime = 0;
+  private isActive = false;
+  private silenceDetector: SilenceDetector | null = null;
+
+  constructor(
+    stream: MediaStream,
+    sessionId: string,
+    config: AudioStreamConfig
+  ) {
+    this.stream = stream;
+    this.sessionId = sessionId;
+    this.config = config;
+  }
+
+  async start(silenceDetector?: SilenceDetector): Promise<void> {
+    try {
+      this.silenceDetector = silenceDetector || null;
+
+      this.audioContext = new AudioContext({
+        sampleRate: this.config.sampleRate,
+      });
+      const source = this.audioContext.createMediaStreamSource(this.stream);
+
+      this.scriptProcessor = this.audioContext.createScriptProcessor(
+        this.config.bufferSize,
+        1,
+        1
+      );
+
+      this.scriptProcessor.onaudioprocess = this.handleAudioProcess.bind(this);
+
+      source.connect(this.scriptProcessor);
+      this.scriptProcessor.connect(this.audioContext.destination);
+
+      this.isActive = true;
+      this.lastSendTime = Date.now();
+
+      console.log("🎵 Audio stream manager started with silence detection");
+    } catch (error) {
+      console.error("❌ Failed to start audio stream:", error);
+      throw error;
+    }
+  }
+
+  private handleAudioProcess(event: AudioProcessingEvent): void {
+    if (!this.isActive) return;
+
+    const inputBuffer = event.inputBuffer;
+    const inputData = inputBuffer.getChannelData(0);
+
+    // Calculate audio level for silence detection
+    let audioLevel = 0;
+    for (let i = 0; i < inputData.length; i++) {
+      audioLevel += Math.abs(inputData[i]);
+    }
+    audioLevel = audioLevel / inputData.length;
+
+    // Update silence detector with current audio level
+    if (this.silenceDetector) {
+      this.silenceDetector.updateAudioLevel(audioLevel);
+    }
+
+    // Convert to PCM
+    const pcmData = new Int16Array(inputData.length);
+    for (let i = 0; i < inputData.length; i++) {
+      const sample = Math.max(-1, Math.min(1, inputData[i]));
+      pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+
+    this.audioBuffer.push(pcmData);
+
+    // Send data at configured interval (much less frequent now)
+    const now = Date.now();
+    if (now - this.lastSendTime >= this.config.sendIntervalMs) {
+      this.sendBufferedAudio();
+      this.lastSendTime = now;
+    }
+  }
+
+  private async sendBufferedAudio(): Promise<void> {
+    if (this.audioBuffer.length === 0) return;
+
+    try {
+      // Combine buffered chunks
+      const totalLength = this.audioBuffer.reduce(
+        (sum, chunk) => sum + chunk.length,
+        0
+      );
+      const combinedPCM = new Int16Array(totalLength);
+
+      let offset = 0;
+      for (const chunk of this.audioBuffer) {
+        combinedPCM.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      // Send to server (non-blocking)
+      const uint8Data = new Uint8Array(combinedPCM.buffer);
+
+      fetch(`/api/transcribe-stream-realtime?session=${this.sessionId}`, {
+        method: "POST",
+        body: uint8Data,
+        headers: { "Content-Type": "audio/pcm" },
+      }).catch(() => {
+        // Silent error handling - don't spam console
+      });
+
+      // Clear buffer
+      this.audioBuffer = [];
+    } catch (error) {
+      // Silent error handling
+    }
+  }
+
+  stop(): void {
+    console.log("🛑 Stopping audio stream manager");
+
+    this.isActive = false;
+
+    if (this.scriptProcessor) {
+      this.scriptProcessor.disconnect();
+      this.scriptProcessor = null;
+    }
+
+    if (this.audioContext) {
+      this.audioContext.close().catch(() => {});
+      this.audioContext = null;
+    }
+
+    if (this.stream) {
+      this.stream.getTracks().forEach((track) => track.stop());
+    }
+
+    this.audioBuffer = [];
+  }
+}
+
+// ============================================================================
+// CONNECTION MANAGER CLASS
+// ============================================================================
+
+class ConnectionManager {
+  private eventSource: EventSource | null = null;
+  private onEvent: (event: StreamingTranscriptEvent) => void;
+  private connectionCheckInterval: NodeJS.Timeout | null = null;
+
+  constructor(onEvent: (event: StreamingTranscriptEvent) => void) {
+    this.onEvent = onEvent;
+  }
+
+  async connect(): Promise<string> {
+    return new Promise((resolve, reject) => {
+      try {
+        console.log("📡 Connecting to transcription service...");
+
+        this.eventSource = new EventSource("/api/transcribe-stream-realtime");
+
+        this.eventSource.onopen = () => {
+          console.log("✅ Connection established");
+        };
+
+        this.eventSource.onmessage = (event) => {
+          try {
+            const data: StreamingTranscriptEvent = JSON.parse(event.data);
+
+            if (data.type === "connected" && data.sessionId) {
+              resolve(data.sessionId);
+            }
+
+            this.onEvent(data);
+          } catch (error) {
+            console.warn("Failed to parse message:", error);
+          }
+        };
+
+        this.eventSource.onerror = (error) => {
+          console.error("❌ Connection error:", error);
+          this.onEvent({ type: "error", error: "Connection failed" });
+          reject(error);
+        };
+
+        // Monitor connection health
+        this.startConnectionMonitoring();
+      } catch (error) {
+        console.error("❌ Failed to establish connection:", error);
+        reject(error);
+      }
+    });
+  }
+
+  private startConnectionMonitoring(): void {
+    this.connectionCheckInterval = setInterval(() => {
+      if (this.eventSource?.readyState === EventSource.CLOSED) {
+        console.log("📡 Connection closed detected");
+        this.onEvent({ type: "completed" });
+        this.stopConnectionMonitoring();
+      }
+    }, 2000); // Check every 2 seconds (less frequent)
+  }
+
+  private stopConnectionMonitoring(): void {
+    if (this.connectionCheckInterval) {
+      clearInterval(this.connectionCheckInterval);
+      this.connectionCheckInterval = null;
+    }
+  }
+
+  disconnect(): void {
+    console.log("📡 Disconnecting...");
+
+    this.stopConnectionMonitoring();
+
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+  }
+}
+
+// ============================================================================
+// SILENCE DETECTOR CLASS
+// ============================================================================
+
+class SilenceDetector {
+  private config: AudioStreamConfig;
+  private onSilenceDetected: () => void;
+  private onDebugUpdate: (message: string) => void;
+  private isActive = false;
+  private silenceCount = 0;
+  private checkInterval: NodeJS.Timeout | null = null;
+  private lastAudioLevel = 0;
+
+  constructor(
+    config: AudioStreamConfig,
+    onSilenceDetected: () => void,
+    onDebugUpdate: (message: string) => void
+  ) {
+    this.config = config;
+    this.onSilenceDetected = onSilenceDetected;
+    this.onDebugUpdate = onDebugUpdate;
+  }
+
+  start(): void {
+    console.log("🔇 Starting silence detection");
+
+    this.isActive = true;
+    this.silenceCount = 0;
+
+    const maxSilenceChecks = this.config.silenceTimeoutMs / 200; // Check every 200ms
+
+    this.checkInterval = setInterval(() => {
+      if (!this.isActive) return;
+
+      const hasVoice = this.lastAudioLevel > this.config.silenceThreshold;
+
+      console.log(
+        `🔊 Audio level: ${this.lastAudioLevel.toFixed(4)}, threshold: ${
+          this.config.silenceThreshold
+        }, hasVoice: ${hasVoice}, silenceCount: ${this.silenceCount}`
+      );
+
+      if (hasVoice) {
+        // Reset silence counter when voice is detected
+        if (this.silenceCount > 0) {
+          console.log("🎤 Voice detected - resetting silence timer");
+        }
+        this.silenceCount = 0;
+        this.onDebugUpdate("🎤 Voice detected - transcribing...");
+      } else {
+        this.silenceCount++;
+        const remainingSeconds = Math.max(
+          0,
+          5 - Math.floor(this.silenceCount * 0.2)
+        );
+        this.onDebugUpdate(`🔇 Silence... auto-stop in ${remainingSeconds}s`);
+
+        if (this.silenceCount >= maxSilenceChecks) {
+          console.log(
+            "⏰ Silence timeout reached after 5 seconds of actual silence"
+          );
+          this.onSilenceDetected();
+          return;
+        }
+      }
+
+      this.lastAudioLevel = 0; // Reset for next check
+    }, 200);
+  }
+
+  updateAudioLevel(level: number): void {
+    this.lastAudioLevel = Math.max(this.lastAudioLevel, level);
+  }
+
+  stop(): void {
+    console.log("🛑 Stopping silence detection");
+
+    this.isActive = false;
+
+    if (this.checkInterval) {
+      clearInterval(this.checkInterval);
+      this.checkInterval = null;
+    }
+  }
 }
